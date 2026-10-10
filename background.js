@@ -1,10 +1,15 @@
 // CizgiVeDizi Video Link Extractor - Background Script
-// STABLE VERSION
+
+// Aynı anda taranan bölüm sayısı
+const SCAN_CONCURRENCY = 3;
+// Toplu indirmede iki video arasındaki bekleme (sibnet'i boğmamak için)
+const DOWNLOAD_GAP_MS = 1500;
 
 let scanQueue = [];
-let scanResults = [];
+let scanResults = []; // bölüm sırasına göre slotlar (paralel taramada sıra korunur)
 let isScanning = false;
-let currentScanTabId = null;
+let scanId = 0;
+const scanTabIds = new Set();
 let totalEpisodes = 0;
 let completedEpisodes = 0;
 let seriesTitle = '';
@@ -30,7 +35,6 @@ async function loadState() {
         totalEpisodes = state.total || state.results.length;
         completedEpisodes = state.completed || state.results.length;
         seriesTitle = state.seriesTitle || '';
-        console.log("Önceki tarama sonuçları yüklendi:", scanResults.length, "sonuç");
       }
     }
   } catch (e) {
@@ -41,105 +45,202 @@ async function loadState() {
 // Başlangıçta state'i yükle
 loadState();
 
+function currentResults() {
+  return scanResults.filter(Boolean);
+}
+
 async function saveState() {
   await chrome.storage.local.set({
     scanState: {
       isScanning,
       completed: completedEpisodes,
       total: totalEpisodes,
-      results: scanResults,
+      results: currentResults(),
       seriesTitle,
       timestamp: Date.now()
     }
   });
 }
 
+function closeScanTabs() {
+  for (const id of scanTabIds) chrome.tabs.remove(id).catch(() => { });
+  scanTabIds.clear();
+}
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === "start_batch_scan") {
-    scanQueue = [...request.episodes];
-    scanResults = [];
-    totalEpisodes = scanQueue.length;
-    completedEpisodes = 0;
-    isScanning = true;
-    seriesTitle = request.seriesTitle || '';
-    saveState();
-    processNextEpisode();
-    sendResponse({ status: "started", total: totalEpisodes });
-    return true;
-  }
+  switch (request.action) {
+    case "start_batch_scan":
+      startBatchScan(request.episodes, request.seriesTitle);
+      sendResponse({ status: "started", total: totalEpisodes });
+      return;
 
-  if (request.action === "get_scan_status") {
-    sendResponse({
-      isScanning,
-      completed: completedEpisodes,
-      total: totalEpisodes,
-      results: scanResults,
-      seriesTitle
-    });
-    return true;
-  }
+    case "get_scan_status":
+      sendResponse({
+        isScanning,
+        completed: completedEpisodes,
+        total: totalEpisodes,
+        results: currentResults(),
+        seriesTitle
+      });
+      return;
 
-  if (request.action === "cancel_scan") {
-    isScanning = false;
-    scanQueue = [];
-    if (currentScanTabId) {
-      chrome.tabs.remove(currentScanTabId).catch(() => { });
-      currentScanTabId = null;
-    }
-    saveState();
-    sendResponse({ status: "cancelled" });
-    return true;
-  }
+    case "cancel_scan":
+      isScanning = false;
+      scanQueue = [];
+      closeScanTabs();
+      saveState();
+      sendResponse({ status: "cancelled" });
+      return;
 
-  if (request.action === "clear_results") {
-    scanResults = [];
-    completedEpisodes = 0;
-    totalEpisodes = 0;
-    isScanning = false;
-    seriesTitle = '';
-    chrome.storage.local.remove(['scanState']);
-    sendResponse({ status: "cleared" });
-    return true;
-  }
+    case "clear_results":
+      isScanning = false;
+      scanQueue = [];
+      closeScanTabs();
+      scanResults = [];
+      completedEpisodes = 0;
+      totalEpisodes = 0;
+      seriesTitle = '';
+      chrome.storage.local.remove(['scanState']);
+      sendResponse({ status: "cleared" });
+      return;
 
-  if (request.action === "get_direct_video_link") {
-    downloadVideoFromSibnet(request.sibnetUrl, request.filename || 'video.mp4')
-      .then(result => sendResponse(result))
-      .catch(err => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
+    case "get_direct_video_link":
+      downloadVideoFromSibnet(request.sibnetUrl, request.filename || 'video.mp4')
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true; // async cevap
 
-  if (request.action === "start_batch_download") {
-    startBatchDownload(request.videos, request.seriesTitle);
-    sendResponse({ status: "started" });
-    return true;
-  }
+    case "start_batch_download":
+      startBatchDownload(request.videos, request.seriesTitle);
+      sendResponse({ status: "started" });
+      return;
 
-  if (request.action === "get_download_status") {
-    sendResponse({
-      isDownloading,
-      completed: downloadedCount,
-      total: totalDownloads
-    });
-    return true;
-  }
+    case "get_download_status":
+      sendResponse({
+        isDownloading,
+        completed: downloadedCount,
+        total: totalDownloads
+      });
+      return;
 
-  if (request.action === "cancel_download") {
-    isDownloading = false;
-    downloadQueue = [];
-    sendResponse({ status: "cancelled" });
-    return true;
+    case "cancel_download":
+      isDownloading = false;
+      downloadQueue = [];
+      sendResponse({ status: "cancelled" });
+      return;
   }
-
-  return true;
 });
 
-async function downloadVideoFromSibnet(sibnetUrl, filename) {
-  console.log("=== VIDEO İNDİRME (Chrome Downloads API) ===");
-  console.log("URL:", sibnetUrl);
-  console.log("Dosya:", filename);
+// ---------------------------------------------------------------------------
+// Toplu tarama
+// ---------------------------------------------------------------------------
 
+function startBatchScan(episodes, title) {
+  closeScanTabs();
+  const id = ++scanId;
+  scanQueue = episodes.map((episode, index) => ({ episode, index }));
+  scanResults = new Array(episodes.length);
+  totalEpisodes = episodes.length;
+  completedEpisodes = 0;
+  isScanning = true;
+  seriesTitle = title || '';
+  saveState();
+
+  const workers = [];
+  for (let i = 0; i < Math.min(SCAN_CONCURRENCY, scanQueue.length); i++) {
+    workers.push(scanWorker(id));
+  }
+  Promise.all(workers).then(() => {
+    if (id !== scanId) return; // bu arada yeni tarama başladıysa dokunma
+    isScanning = false;
+    saveState();
+  });
+}
+
+async function scanWorker(id) {
+  while (isScanning && id === scanId && scanQueue.length > 0) {
+    const { episode, index } = scanQueue.shift();
+
+    let videoLink = null;
+    try {
+      videoLink = await findEpisodeVideoLink(episode.url, () => isScanning && id === scanId);
+    } catch (e) {
+      console.warn("Bölüm taranamadı:", episode.url, e);
+    }
+
+    if (id !== scanId) return;
+    scanResults[index] = {
+      episodeUrl: episode.url,
+      episodeTitle: episode.title,
+      videoLink
+    };
+    completedEpisodes++;
+    saveState();
+  }
+}
+
+async function findEpisodeVideoLink(url, stillActive) {
+  // Hızlı yol: sayfayı sekme açmadan indirip HTML içinde ara
+  const fromHtml = await fetchSibnetLink(url);
+  if (fromHtml) return fromHtml;
+  if (!stillActive()) return null;
+  // Yedek yol: link JS ile sonradan ekleniyorsa sayfayı gerçek bir sekmede aç
+  return scanEpisodeInTab(url, stillActive);
+}
+
+const IFRAME_SIBNET_RE = /<iframe\b[^>]*?\bsrc\s*=\s*["']([^"']*video\.sibnet\.ru[^"']*)["']/i;
+const SIBNET_URL_RE = /(?:https?:)?\/\/video\.sibnet\.ru\/[^\s"'<>)\\]+/;
+
+async function fetchSibnetLink(url) {
+  try {
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const match = html.match(IFRAME_SIBNET_RE) || html.match(SIBNET_URL_RE);
+    if (!match) return null;
+    let link = (match[1] || match[0]).replace(/&amp;/g, '&');
+    if (link.startsWith('//')) link = 'https:' + link;
+    return link;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function scanEpisodeInTab(url, stillActive) {
+  const tab = await chrome.tabs.create({ url, active: false });
+  scanTabIds.add(tab.id);
+
+  try {
+    await waitForTabLoad(tab.id);
+
+    // Sabit beklemek yerine link görünene kadar kısa aralıklarla sor
+    let injected = false;
+    for (let i = 0; i < 20 && stillActive(); i++) {
+      try {
+        const response = await chrome.tabs.sendMessage(tab.id, { action: "get_sibnet_links" });
+        if (response?.links?.length > 0) return response.links[0].url;
+      } catch (e) {
+        // Content script henüz yok (ör. sayfa sonradan yüklendi) - bir kez elle enjekte et
+        if (!injected) {
+          injected = true;
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => { });
+          continue;
+        }
+      }
+      await sleep(300);
+    }
+    return null;
+  } finally {
+    scanTabIds.delete(tab.id);
+    chrome.tabs.remove(tab.id).catch(() => { });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// İndirme
+// ---------------------------------------------------------------------------
+
+async function downloadVideoFromSibnet(sibnetUrl, filename) {
   const match = sibnetUrl.match(/videoid=(\d+)/);
   if (!match) {
     return { success: false, error: 'Video ID bulunamadı' };
@@ -149,59 +250,50 @@ async function downloadVideoFromSibnet(sibnetUrl, filename) {
   const shellUrl = `https://video.sibnet.ru/shell.php?videoid=${videoId}`;
 
   let tab = null;
+  let cdnTab = null;
 
   try {
-    // 1. Sibnet sayfasını aç
-    console.log("1. Sibnet sayfası açılıyor...");
+    // 1. Sibnet sayfasını aç (arka plan sekmelerinde medya başlamadığı için aktif)
     tab = await chrome.tabs.create({ url: shellUrl, active: true });
-
-    // Sayfa yüklenmesini bekle
     await waitForTabLoad(tab.id);
-    await sleep(3000);
 
     // 2. Play butonuna tıkla ve CDN URL bul
-    console.log("2. Video URL aranıyor...");
     const result = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: async () => {
-        // Play butonuna bas
-        const playBtn = document.querySelector('.vjs-big-play-button');
-        if (playBtn) {
-          playBtn.click();
-          console.log("Play butonuna tıklandı");
+        const wait = ms => new Promise(r => setTimeout(r, ms));
+        const CDN_RE = /https:\/\/(cvs|dv)\d+(-\d+)?\.sibnet\.ru.*\.mp4/;
+
+        // Oynatıcı hazır olana kadar bekle (en fazla ~5 sn)
+        let video = null;
+        let playBtn = null;
+        for (let i = 0; i < 20; i++) {
+          video = document.querySelector('video');
+          playBtn = document.querySelector('.vjs-big-play-button');
+          if (video || playBtn) break;
+          await wait(250);
         }
 
-        // Video elementini bul ve oynat
-        const video = document.querySelector('video');
+        if (playBtn) playBtn.click();
         if (video) {
           video.muted = true;
           try { await video.play(); } catch (e) { }
         }
 
-        // CDN URL için bekle (Performance API)
+        // CDN URL için bekle (Performance API), en fazla ~30 sn
         let cdnUrl = null;
-        for (let i = 0; i < 60; i++) {
-          await new Promise(r => setTimeout(r, 500));
-
-          const entries = performance.getEntriesByType('resource');
-          for (const entry of entries) {
-            if (entry.name.match(/https:\/\/(cvs|dv)\d+(-\d+)?\.sibnet\.ru.*\.mp4/)) {
-              cdnUrl = entry.name;
-              break;
-            }
-          }
-
-          if (cdnUrl) break;
-
-          // Video src'den de dene
-          if (video && video.src && video.src.includes('.mp4')) {
+        for (let i = 0; i < 120 && !cdnUrl; i++) {
+          const entry = performance.getEntriesByType('resource').find(e => CDN_RE.test(e.name));
+          if (entry) {
+            cdnUrl = entry.name;
+          } else if (video && video.src && video.src.includes('.mp4')) {
             cdnUrl = video.src;
-            break;
+          } else {
+            await wait(250);
           }
         }
 
         if (video) video.pause();
-
         return cdnUrl;
       }
     });
@@ -209,31 +301,24 @@ async function downloadVideoFromSibnet(sibnetUrl, filename) {
     const cdnUrl = result?.[0]?.result;
 
     // Shell sekmesini kapat
-    if (tab) {
-      await chrome.tabs.remove(tab.id).catch(() => { });
-      tab = null;
-    }
+    await chrome.tabs.remove(tab.id).catch(() => { });
+    tab = null;
 
     if (!cdnUrl) {
       return { success: false, error: 'Video URL bulunamadı' };
     }
 
-    console.log("CDN URL bulundu:", cdnUrl);
-
-    // MP4 kontrolü
     if (!cdnUrl.includes('.mp4')) {
       return { success: false, error: 'Geçersiz URL (mp4 değil): ' + cdnUrl.substring(0, 60) };
     }
 
     // 3. CDN sekmesini aç
-    console.log("3. CDN sekmesi açılıyor...");
-    const cdnTab = await chrome.tabs.create({ url: cdnUrl, active: true });
-
+    cdnTab = await chrome.tabs.create({ url: cdnUrl, active: true });
     await waitForTabLoad(cdnTab.id);
-    await sleep(2000);
+    await sleep(500);
 
-    // 4. Sekme içinden indirme başlat (a.download ile)
-    console.log("4. Sekme içinden indirme başlatılıyor...");
+    // 4. Sekme içinden indirme başlat (a.download ile) ve Chrome indirmeyi oluşturana kadar bekle
+    const downloadCreated = waitForDownloadCreated(15000);
     await chrome.scripting.executeScript({
       target: { tabId: cdnTab.id },
       func: (fname) => {
@@ -243,152 +328,82 @@ async function downloadVideoFromSibnet(sibnetUrl, filename) {
         document.body.appendChild(a);
         a.click();
         a.remove();
-        console.log("İndirme linki tıklandı:", fname);
       },
       args: [filename]
     });
-
-    console.log("İndirme başlatıldı");
-
-    // Biraz bekle ve CDN sekmesini kapat
-    await sleep(3000);
-    try { await chrome.tabs.remove(cdnTab.id); } catch { }
+    await downloadCreated;
 
     return { success: true, cdnUrl };
 
   } catch (err) {
-    console.error("Hata:", err);
-    if (tab) await chrome.tabs.remove(tab.id).catch(() => { });
+    console.error("İndirme hatası:", err);
     return { success: false, error: err.message };
+  } finally {
+    if (tab) chrome.tabs.remove(tab.id).catch(() => { });
+    if (cdnTab) chrome.tabs.remove(cdnTab.id).catch(() => { });
   }
 }
 
 async function startBatchDownload(videos, title) {
+  if (isDownloading) return;
   downloadQueue = videos.filter(v => v.videoLink);
   totalDownloads = downloadQueue.length;
   downloadedCount = 0;
   isDownloading = true;
-  seriesTitle = title || '';
+  seriesTitle = title || seriesTitle;
 
-  console.log(`=== TOPLU İNDİRME: ${totalDownloads} video ===`);
-  processNextDownload();
+  while (isDownloading && downloadQueue.length > 0) {
+    const video = downloadQueue.shift();
+    downloadedCount++;
+
+    const safeTitle = (video.episodeTitle || 'video')
+      .replace(/[^a-zA-Z0-9ğüşıöçĞÜŞİÖÇ _-]/g, '')
+      .substring(0, 80);
+
+    const result = await downloadVideoFromSibnet(video.videoLink, safeTitle + '.mp4');
+    if (!result.success) console.error("İndirme hatası:", video.videoLink, result.error);
+
+    if (downloadQueue.length > 0) await sleep(DOWNLOAD_GAP_MS);
+  }
+
+  isDownloading = false;
 }
 
-async function processNextDownload() {
-  if (!isDownloading || downloadQueue.length === 0) {
-    isDownloading = false;
-    console.log("=== TOPLU İNDİRME TAMAMLANDI ===");
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Yardımcılar
+// ---------------------------------------------------------------------------
 
-  const video = downloadQueue.shift();
-  downloadedCount++;
-
-  const safeTitle = (video.episodeTitle || 'video')
-    .replace(/[^a-zA-Z0-9ğüşıöçĞÜŞİÖÇ _-]/g, '')
-    .substring(0, 80);
-  const filename = safeTitle + '.mp4';
-
-  console.log(`[${downloadedCount}/${totalDownloads}] İndiriliyor: ${filename}`);
-
-  try {
-    await downloadVideoFromSibnet(video.videoLink, filename);
-  } catch (e) {
-    console.error("İndirme hatası:", e);
-  }
-
-  await sleep(3000);
-  processNextDownload();
-}
-
-async function processNextEpisode() {
-  if (!isScanning || scanQueue.length === 0) {
-    isScanning = false;
-    await saveState();
-    return;
-  }
-
-  const episode = scanQueue.shift();
-  completedEpisodes++;
-
-  try {
-    const tab = await chrome.tabs.create({ url: episode.url, active: false });
-    currentScanTabId = tab.id;
-
-    await waitForTabLoad(tab.id);
-    await sleep(2000);
-
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ['content.js']
-      });
-    } catch (e) { }
-
-    await sleep(500);
-
-    let videoLink = null;
-    try {
-      const response = await chrome.tabs.sendMessage(tab.id, { action: "get_sibnet_links" });
-      if (response && response.links && response.links.length > 0) {
-        videoLink = response.links[0].url;
-      }
-    } catch (e) { }
-
-    scanResults.push({
-      episodeUrl: episode.url,
-      episodeTitle: episode.title,
-      videoLink
-    });
-
-    await saveState();
-    await chrome.tabs.remove(tab.id).catch(() => { });
-    currentScanTabId = null;
-
-  } catch (err) {
-    scanResults.push({
-      episodeUrl: episode.url,
-      episodeTitle: episode.title,
-      videoLink: null
-    });
-    await saveState();
-    if (currentScanTabId) {
-      await chrome.tabs.remove(currentScanTabId).catch(() => { });
-      currentScanTabId = null;
+function waitForDownloadCreated(timeoutMs) {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(done, timeoutMs);
+    function done(item) {
+      clearTimeout(timeout);
+      chrome.downloads.onCreated.removeListener(done);
+      resolve(item || null);
     }
-  }
-
-  await sleep(300);
-  processNextEpisode();
+    chrome.downloads.onCreated.addListener(done);
+  });
 }
 
 function waitForTabLoad(tabId) {
   return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
+    const timeout = setTimeout(done, 30000);
+
+    function done() {
+      clearTimeout(timeout);
       chrome.tabs.onUpdated.removeListener(listener);
       resolve();
-    }, 30000);
+    }
 
     function listener(id, info) {
-      if (id === tabId && info.status === 'complete') {
-        clearTimeout(timeout);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
+      if (id === tabId && info.status === 'complete') done();
     }
 
     chrome.tabs.onUpdated.addListener(listener);
 
-    chrome.tabs.get(tabId).then(tab => {
-      if (tab.status === 'complete') {
-        clearTimeout(timeout);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    }).catch(() => {
-      clearTimeout(timeout);
-      resolve();
-    });
+    chrome.tabs.get(tabId)
+      .then(tab => { if (tab.status === 'complete') done(); })
+      .catch(done);
   });
 }
 

@@ -1,75 +1,59 @@
 // CizgiVeDizi.com Video Link Extractor
 // video.sibnet.ru linklerini bulur - Sezon desteği ile
 
+// Manifest content script'i + executeScript ile ikinci kez enjekte edilirse
+// tekrar listener eklenmesin (aksi halde her mesaja iki kez cevap verilir).
+if (!window.__cvdExtractorLoaded) {
+window.__cvdExtractorLoaded = true;
+
+const SIBNET_URL_RE = /(?:https?:)?\/\/video\.sibnet\.ru\/[^\s"'<>)\\]+/g;
+
+function normalizeSibnetUrl(url) {
+    return url.startsWith('//') ? 'https:' + url : url;
+}
+
 // Sayfadaki tüm sibnet video linklerini bul
 function findSibnetVideoLinks() {
     const links = [];
+    const seen = new Set();
+    const title = document.title;
+
+    const add = (url, type, extra) => {
+        url = normalizeSibnetUrl(url);
+        if (seen.has(url)) return;
+        seen.add(url);
+        links.push({ url, type, title, ...extra });
+    };
 
     // 1. iframe src'lerinde ara
-    const iframes = document.querySelectorAll('iframe');
-    iframes.forEach(iframe => {
-        if (iframe.src && iframe.src.includes('video.sibnet.ru')) {
-            links.push({
-                url: iframe.src,
-                type: 'iframe',
-                title: document.title
-            });
-        }
-    });
+    for (const iframe of document.querySelectorAll('iframe[src*="video.sibnet.ru"]')) {
+        add(iframe.src, 'iframe');
+    }
 
-    // 2. Tüm elementlerin attribute'larında sibnet linki ara
-    const allElements = document.querySelectorAll('*');
-    allElements.forEach(el => {
-        for (let i = 0; i < el.attributes.length; i++) {
-            const attr = el.attributes[i];
-            if (attr.value.includes('video.sibnet.ru') && !links.some(l => l.url === attr.value)) {
-                let url = attr.value;
-                if (url.startsWith('//')) {
-                    url = 'https:' + url;
-                }
-                if (url.includes('video.sibnet.ru')) {
-                    links.push({
-                        url: url,
-                        type: 'attribute',
-                        attrName: attr.name,
-                        title: document.title
-                    });
-                }
-            }
+    // 2. Attribute'larda ara (XPath ile tek native sorgu; tüm DOM'u JS'te gezmekten çok daha hızlı)
+    const attrs = document.evaluate(
+        '//@*[contains(., "video.sibnet.ru")]',
+        document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+    );
+    for (let i = 0; i < attrs.snapshotLength; i++) {
+        const attr = attrs.snapshotItem(i);
+        const value = attr.value.trim();
+        const urls = value.match(SIBNET_URL_RE) || (value.startsWith('video.sibnet.ru/') ? ['https://' + value] : []);
+        for (const url of urls) {
+            add(url, 'attribute', { attrName: attr.name });
         }
-    });
+    }
 
-    // 3. Script içeriğinde sibnet linki ara
-    const scripts = document.querySelectorAll('script');
-    const sibnetRegex = /https?:\/\/video\.sibnet\.ru\/[^\s"'<>]+/g;
-    scripts.forEach(script => {
-        if (script.textContent) {
-            const matches = script.textContent.match(sibnetRegex);
-            if (matches) {
-                matches.forEach(match => {
-                    if (!links.some(l => l.url === match)) {
-                        links.push({
-                            url: match,
-                            type: 'script',
-                            title: document.title
-                        });
-                    }
-                });
-            }
+    // 3. Script içeriğinde ara
+    for (const script of document.scripts) {
+        const text = script.textContent;
+        if (!text || !text.includes('video.sibnet.ru')) continue;
+        for (const url of text.match(SIBNET_URL_RE) || []) {
+            if (url.startsWith('http')) add(url, 'script');
         }
-    });
+    }
 
-    // Duplicate'ları temizle
-    const uniqueLinks = [];
-    const seen = new Set();
-    links.forEach(link => {
-        if (!seen.has(link.url)) {
-            seen.add(link.url);
-            uniqueLinks.push(link);
-        }
-    });
-
-    return uniqueLinks;
+    return links;
 }
 
 // Sezon bilgilerini bul
@@ -77,9 +61,7 @@ function findSeasons() {
     const seasons = [];
 
     // Sezon butonlarını bul (label.btn-outline-primary)
-    const seasonLabels = document.querySelectorAll('label.btn-outline-primary');
-
-    seasonLabels.forEach(label => {
+    for (const label of document.querySelectorAll('label.btn-outline-primary')) {
         const text = label.textContent.trim();
         // "Tüm Bölümler" veya sezon numarası
         if (text === 'Tüm Bölümler' || /^\d+$/.test(text)) {
@@ -92,7 +74,7 @@ function findSeasons() {
                 inputId: input ? input.id : null
             });
         }
-    });
+    }
 
     // Sezon numarasına göre sırala (Tüm Bölümler en başta)
     seasons.sort((a, b) => a.seasonNum - b.seasonNum);
@@ -103,89 +85,62 @@ function findSeasons() {
 // Dizi ana sayfasındaki tüm bölüm linklerini bul (TÜM SEZONLAR DAHİL)
 function findEpisodeLinks() {
     const episodes = [];
+    const seen = new Set();
     const baseUrl = window.location.href.replace(/\/$/, '');
 
     // Tüm a.bolum linklerini al (gizli olanlar dahil - DOM'da hepsi mevcut)
-    const episodeLinks = document.querySelectorAll('a.bolum');
+    for (const link of document.querySelectorAll('a.bolum')) {
+        if (!link.href || link.href === baseUrl || link.href.includes('random') || seen.has(link.href)) continue;
+        seen.add(link.href);
 
-    episodeLinks.forEach(link => {
-        if (link.href && link.href !== baseUrl && !link.href.includes('random')) {
-            // Bölüm numarası ve adını çıkar
-            const urlParts = link.href.split('/');
-            const episodeNum = urlParts[urlParts.length - 2] || '';
-            const episodeName = urlParts[urlParts.length - 1] || '';
+        // Bölüm numarası ve adını çıkar
+        const urlParts = link.href.split('/');
+        const episodeNum = urlParts[urlParts.length - 2] || '';
+        const episodeName = urlParts[urlParts.length - 1] || '';
 
-            // Sezon bilgisini bulmaya çalış
-            // URL'den veya parent element'ten sezon numarası çıkarılabilir
-            let seasonNum = null;
-            const parent = link.closest('[data-season]');
-            if (parent) {
-                seasonNum = parent.getAttribute('data-season');
-            }
+        // Sezon bilgisi (varsa parent element'ten)
+        const parent = link.closest('[data-season]');
+        const seasonNum = parent ? parent.getAttribute('data-season') : null;
 
-            // Thumbnail varsa al
-            const img = link.querySelector('img');
-            const thumbnail = img ? img.src : null;
+        // Thumbnail varsa al
+        const img = link.querySelector('img');
+        const thumbnail = img ? img.src : null;
 
-            // Bölüm başlığını al
-            const titleEl = link.querySelector('.bolum_isim') || link.querySelector('h5') || link;
-            let title = titleEl.textContent?.trim() || `Bölüm ${episodeNum}`;
-
-            // Başlıktan gereksiz boşlukları ve formatı temizle
-            title = title.replace(/\s+/g, ' ').trim();
-
+        // Bölüm başlığını al
+        const titleEl = link.querySelector('.bolum_isim') || link.querySelector('h5') || link;
+        let title = (titleEl.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim()
             // "11)" veya "1)" gibi başlangıç numaralarını temizle
-            title = title.replace(/^\d+\)\s*/, '');
+            .replace(/^\d+\)\s*/, '');
 
-            // Eğer başlık boş kaldıysa bölüm numarasını kullan
-            if (!title) {
-                title = `Bölüm ${episodeNum}`;
-            } else {
-                // Başlığın başına düzgün bölüm numarası ekle
-                title = `${episodeNum}. ${title}`;
-            }
+        // Başlık boşsa bölüm numarasını, değilse numaralı başlığı kullan
+        title = title ? `${episodeNum}. ${title}` : `Bölüm ${episodeNum}`;
 
-            if (!episodes.some(e => e.url === link.href)) {
-                episodes.push({
-                    url: link.href,
-                    episodeNum: episodeNum,
-                    episodeName: episodeName,
-                    seasonNum: seasonNum,
-                    title: title,
-                    thumbnail: thumbnail
-                });
-            }
-        }
-    });
+        episodes.push({ url: link.href, episodeNum, episodeName, seasonNum, title, thumbnail });
+    }
 
     // Eğer a.bolum bulunamazsa, genel link araması yap
     if (episodes.length === 0) {
         const currentPath = window.location.pathname;
-        const allLinks = document.querySelectorAll(`a[href*="${currentPath}"]`);
-        allLinks.forEach(link => {
+        for (const link of document.querySelectorAll(`a[href*="${CSS.escape(currentPath)}"]`)) {
             const segments = link.href.split('/').filter(s => s);
-            if (segments.length >= 6 && link.href !== baseUrl && !link.href.includes('random')) {
-                const episodeNum = segments[segments.length - 2] || '';
-                const episodeName = segments[segments.length - 1] || '';
+            if (segments.length < 6 || link.href === baseUrl || link.href.includes('random') || seen.has(link.href)) continue;
+            seen.add(link.href);
 
-                if (!episodes.some(e => e.url === link.href)) {
-                    episodes.push({
-                        url: link.href,
-                        episodeNum: episodeNum,
-                        episodeName: episodeName,
-                        title: link.textContent?.trim() || `Bölüm ${episodeNum}`
-                    });
-                }
-            }
-        });
+            const episodeNum = segments[segments.length - 2] || '';
+            const episodeName = segments[segments.length - 1] || '';
+            episodes.push({
+                url: link.href,
+                episodeNum,
+                episodeName,
+                title: link.textContent?.trim() || `Bölüm ${episodeNum}`
+            });
+        }
     }
 
     // Bölüm numarasına göre sırala
-    episodes.sort((a, b) => {
-        const numA = parseInt(a.episodeNum) || 0;
-        const numB = parseInt(b.episodeNum) || 0;
-        return numA - numB;
-    });
+    episodes.sort((a, b) => (parseInt(a.episodeNum) || 0) - (parseInt(b.episodeNum) || 0));
 
     return episodes;
 }
@@ -197,7 +152,6 @@ function getPageType() {
 
     // /dizi/category/series = dizi sayfası (3-4 segment)
     // /dizi/category/series/ep/name = bölüm sayfası (5+ segment)
-
     if (segments.length >= 6) {
         return 'episode';
     } else if (segments.length >= 4 && url.includes('/dizi/')) {
@@ -206,18 +160,17 @@ function getPageType() {
     return 'unknown';
 }
 
-// Popup'tan gelen mesajları dinle
+// Popup'tan / background'dan gelen mesajları dinle.
+// Cevaplar senkron verildiği için kanalı açık tutmaya (return true) gerek yok.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "get_sibnet_links") {
-        const links = findSibnetVideoLinks();
-        console.log("Bulunan Sibnet linkleri:", links);
-        sendResponse({ links: links });
+        sendResponse({ links: findSibnetVideoLinks() });
+        return;
     }
 
     if (request.action === "get_episode_links") {
-        const episodes = findEpisodeLinks();
-        console.log("Bulunan bölümler:", episodes);
-        sendResponse({ episodes: episodes });
+        sendResponse({ episodes: findEpisodeLinks() });
+        return;
     }
 
     if (request.action === "get_page_info") {
@@ -238,15 +191,5 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             videoLinks: videoLinks
         });
     }
-
-    return true;
 });
-
-// Debug için sayfa yüklendiğinde bilgi logla
-console.log("CizgiVeDizi Video Extractor yüklendi - Sayfa türü:", getPageType());
-const pageType = getPageType();
-if (pageType === 'series') {
-    const seasons = findSeasons();
-    const episodes = findEpisodeLinks();
-    console.log(`Sezon sayısı: ${seasons.length}, Toplam bölüm: ${episodes.length}`);
 }

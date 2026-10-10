@@ -13,7 +13,7 @@
             ]
         },
         "condition": {
-            "urlFilter": "*sibnet.ru*",
+            "urlFilter": "||sibnet.ru^",
             "resourceTypes": [
                 "main_frame",
                 "sub_frame",
@@ -31,4 +31,4 @@
             ]
         }
     }
-]
+]

@@ -36,9 +36,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let scanResults = [];
     let statusCheckInterval = null;
     let seriesTitle = '';
-    let isDownloading = false;
-    let downloadQueue = [];
-    let downloadedCount = 0;
+    let renderedKey = '';
 
     // ÖNCELİKLE: Kayıtlı durumu kontrol et
     await checkSavedState();
@@ -117,7 +115,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
-            if (!tab || !tab.url.includes('cizgivedizi.com')) {
+            if (!tab || !tab.url?.includes('cizgivedizi.com')) {
                 showUnknownView();
                 return;
             }
@@ -188,6 +186,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                     episodesBySeason[season.seasonNum] = [];
                 }
             });
+
+            // Sayfa bölümlere data-season vermişse onu kullan, yoksa eşit böl
+            if (allEpisodes.every(ep => ep.seasonNum && episodesBySeason[ep.seasonNum])) {
+                allEpisodes.forEach(ep => episodesBySeason[ep.seasonNum].push(ep));
+                return;
+            }
 
             const seasonsCount = data.seasons.filter(s => !s.isAll).length;
             const episodesPerSeason = Math.ceil(allEpisodes.length / seasonsCount);
@@ -557,8 +561,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             if (!response.isScanning && response.completed > 0) {
                 stopStatusCheck();
-                scanResults = response.results;
-                displayResults(response.results);
                 resetUI();
                 addNewScanButton();
 
@@ -570,57 +572,68 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function displayResults(resultsList) {
         scanResults = resultsList;
-        linkList.innerHTML = '';
-
-        const validResults = resultsList.filter(r => r.videoLink);
-        linkCountDisplay.textContent = validResults.length;
-
-        resultsList.forEach((result, index) => {
-            const item = document.createElement('div');
-            item.className = 'link-item' + (result.videoLink ? '' : ' no-video');
-            item.innerHTML = `
-                <div class="link-index">${index + 1}</div>
-                <div class="link-info">
-                    <div class="link-title">${result.episodeTitle || 'Bölüm ' + (index + 1)}</div>
-                    <div class="link-url">${result.videoLink || 'Video linki bulunamadı'}</div>
-                </div>
-                ${result.videoLink ? `
-                <div class="link-actions">
-                    <button class="download-btn" data-url="${result.videoLink}" data-title="${result.episodeTitle}" title="İndir">📥</button>
-                    <button class="copy-btn" data-url="${result.videoLink}" title="Kopyala">📋</button>
-                    <button class="open-btn" data-url="${result.videoLink}" title="Aç">🔗</button>
-                </div>
-                ` : ''}
-            `;
-            linkList.appendChild(item);
-        });
-
         results.style.display = 'block';
 
-        // İndirme butonları
-        linkList.querySelectorAll('.download-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                downloadSingleVideo(btn.dataset.url, btn.dataset.title, btn);
-            });
+        // Durum her saniye sorgulanıyor; liste değişmediyse DOM'a dokunma
+        const key = resultsList.map(r => r.videoLink || '-').join('|');
+        if (key === renderedKey) return;
+        renderedKey = key;
+
+        linkCountDisplay.textContent = resultsList.filter(r => r.videoLink).length;
+
+        const fragment = document.createDocumentFragment();
+        resultsList.forEach((result, index) => {
+            const item = el('div', 'link-item' + (result.videoLink ? '' : ' no-video'));
+            item.append(el('div', 'link-index', String(index + 1)));
+
+            const info = el('div', 'link-info');
+            info.append(
+                el('div', 'link-title', result.episodeTitle || 'Bölüm ' + (index + 1)),
+                el('div', 'link-url', result.videoLink || 'Video linki bulunamadı')
+            );
+            item.append(info);
+
+            if (result.videoLink) {
+                const actions = el('div', 'link-actions');
+                for (const [cls, icon, label] of [['download-btn', '📥', 'İndir'], ['copy-btn', '📋', 'Kopyala'], ['open-btn', '🔗', 'Aç']]) {
+                    const btn = el('button', cls, icon);
+                    btn.title = label;
+                    btn.dataset.url = result.videoLink;
+                    btn.dataset.title = result.episodeTitle || '';
+                    actions.append(btn);
+                }
+                item.append(actions);
+            }
+            fragment.append(item);
         });
 
-        // Kopyalama butonları
-        linkList.querySelectorAll('.copy-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                navigator.clipboard.writeText(btn.dataset.url).then(() => {
-                    btn.textContent = '✅';
-                    setTimeout(() => btn.textContent = '📋', 1500);
-                });
-            });
-        });
-
-        // Açma butonları
-        linkList.querySelectorAll('.open-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                chrome.tabs.create({ url: btn.dataset.url });
-            });
-        });
+        linkList.replaceChildren(fragment);
     }
+
+    function el(tag, className, text) {
+        const node = document.createElement(tag);
+        node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+    }
+
+    // Satır butonları için tek bir delege dinleyici (her çizimde yeniden bağlamak yerine)
+    linkList.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-url]');
+        if (!btn) return;
+        const url = btn.dataset.url;
+
+        if (btn.classList.contains('download-btn')) {
+            downloadSingleVideo(url, btn.dataset.title, btn);
+        } else if (btn.classList.contains('copy-btn')) {
+            navigator.clipboard.writeText(url).then(() => {
+                btn.textContent = '✅';
+                setTimeout(() => btn.textContent = '📋', 1500);
+            });
+        } else if (btn.classList.contains('open-btn')) {
+            chrome.tabs.create({ url });
+        }
+    });
 
     function resetUI() {
         scanAllBtn.disabled = false;
@@ -634,13 +647,4 @@ document.addEventListener('DOMContentLoaded', async () => {
         statusMsg.className = 'status-msg ' + type;
     }
 
-    chrome.runtime.onMessage.addListener((request) => {
-        if (request.action === "scan_complete") {
-            scanResults = request.results;
-            displayResults(request.results);
-            resetUI();
-            stopStatusCheck();
-            addNewScanButton();
-        }
-    });
 });
