@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "CizgiVeDizi Video Extractor",
+  "version": "1.2",
+  "description": "cizgivedizi.com sitesinden video linklerini çıkar ve indir",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "clipboardWrite",
+    "downloads",
+    "tabs",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://www.cizgivedizi.com/*",
+    "https://cizgivedizi.com/*",
+    "https://video.sibnet.ru/*",
+    "https://*.sibnet.ru/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "sibnet_referer",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.cizgivedizi.com/*",
+        "https://cizgivedizi.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
